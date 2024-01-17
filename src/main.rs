@@ -23,6 +23,8 @@ pub struct TransactionConfirmRecord {
     pub cu_requested: u64,
     pub cu_consumed: u64,
     pub prioritization_fees: u64,
+    pub number_of_instruction: i32,
+    pub number_of_non_cb_instructions: i32,
 }
 
 async fn fetch_data(
@@ -134,10 +136,13 @@ async fn fetch_data(
                     cu_consumed,
                     cu_requested,
                     prioritization_fees,
+                    number_of_instruction: message.instructions().len() as i32,
+                    number_of_non_cb_instructions: message.instructions().iter().filter(|x| !x.program_id(message.static_account_keys())
+                    .eq(&compute_budget::id())).count() as i32
                 });
             }
             Err(e) => {
-                log::error!("error {}", e);
+                println!("error {}", e);
                 continue;
             }
         }
@@ -199,16 +204,16 @@ async fn main() -> Result<()> {
     let epoch_info = rpc_client.get_epoch_info().await?;
     let previous_epoch = epoch_info.epoch - 1;
     println!("Previous epoch : {}", previous_epoch);
-    let begin_slot = previous_epoch * 432000;
-    let end_slot = (previous_epoch + 1) * 432000;
+    let begin_slot = 552 * 432000;
+    let end_slot = 553 * 432000;
+
     let mut block_slots = vec![];
-    for i in (begin_slot..end_slot).step_by(1000) {
-        let mut b = rpc_client.get_blocks(i, Some(i + 1000)).await?;
+    for i in (begin_slot..end_slot).step_by(100) {
+        let mut b = rpc_client.get_blocks(i, Some(i + 100)).await?;
         block_slots.append(&mut b);
     }
-
     let (sender, reciever) = tokio::sync::mpsc::unbounded_channel::<(u64, UiConfirmedBlock)>();
-    tokio::spawn(async move {
+    let jh = tokio::spawn(async move {
         // let mut writer =
         //     csv_async::AsyncSerializer::from_writer(File::create("out.csv").await.unwrap());
         let mut reciever = reciever;
@@ -229,6 +234,7 @@ async fn main() -> Result<()> {
     for blocks in block_slots.chunks(20) {
         let jhs = blocks
             .iter()
+            .filter(|slot| **slot < end_slot)
             .cloned()
             .map(|slot| {
                 let rpc_client = rpc_client.clone();
@@ -274,5 +280,7 @@ async fn main() -> Result<()> {
             .collect_vec();
         futures::future::join_all(jhs).await;
     }
+    drop(sender);
+    jh.await?;
     Ok(())
 }

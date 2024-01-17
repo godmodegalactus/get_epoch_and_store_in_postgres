@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use itertools::Itertools;
-use solana_sdk::{compute_budget::{self, ComputeBudgetInstruction}, borsh0_10::try_from_slice_unchecked, vote, pubkey::Pubkey};
+use solana_sdk::{compute_budget::{self, ComputeBudgetInstruction}, borsh0_10::try_from_slice_unchecked, vote, program_utils::limited_deserialize};
 use solana_transaction_status::{EncodedTransactionWithStatusMeta, UiConfirmedBlock, RewardType, Reward};
 use tokio_postgres::{tls::MakeTlsConnect, types::ToSql, Client, NoTls, Socket};
 
@@ -34,10 +34,10 @@ impl PostgresSession {
             .context("Connecting to Postgres failed")?;
 
         tokio::spawn(async move {
-            log::info!("Connecting to Postgres");
+            println!("Connecting to Postgres");
 
             if let Err(err) = connection.await {
-                log::error!("Connection to Postgres broke {err:?}");
+                println!("Connection to Postgres broke {err:?}");
                 return;
             }
             unreachable!("Postgres thread returned")
@@ -87,13 +87,13 @@ impl Postgres {
 
     pub async fn save_banking_transaction_results(
         &self,
-        txs: &Vec<TransactionRecord>,
+        txs: &[TransactionRecord],
     ) -> anyhow::Result<()> {
         if txs.is_empty() {
             return Ok(());
         }
 
-        let mut args: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(11 * txs.len());
+        let mut args: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(13 * txs.len());
         for tx in txs.iter() {
             args.push(&tx.slot);
             args.push(&tx.signature);
@@ -106,17 +106,19 @@ impl Postgres {
             args.push(&tx.cu_consumed);
             args.push(&tx.number_of_signatures);
             args.push(&tx.fee);
+            args.push(&tx.number_of_instruction);
+            args.push(&tx.number_of_non_cb_instructions);
         }
 
         let mut query = String::from(
             r#"
                 INSERT INTO epoch_data.transaction_infos 
-                (slot, signature, is_executed_successfully, is_vote, vote_leader_identity, num_slots_voted, cu_requested, prioritization_fees, cu_consumed, number_of_signatures, fee)
+                (slot, signature, is_executed_successfully, is_vote, vote_leader_identity, num_slots_voted, cu_requested, prioritization_fees, cu_consumed, number_of_signatures, fee, number_of_instructions, number_of_non_cb_instructions)
                 VALUES
             "#,
         );
 
-        PostgresSession::multiline_query(&mut query, 11, txs.len(), &[]);
+        PostgresSession::multiline_query(&mut query, 13, txs.len(), &[]);
         self.session.client.execute(&query, &args).await?;
 
         Ok(())
@@ -141,7 +143,7 @@ impl Postgres {
         let mut query = String::from(
             r#"
                 INSERT INTO epoch_data.blocks 
-                (block_hash, slot, block_height, leader_identity, processed_transactions, processed_transactions, successful_transactions, total_cu_used, total_cu_requested, total_rewards, total_prioritization_fees)
+                (block_hash, slot, block_height, leader_identity, processed_transactions, successful_transactions, total_cu_used, total_cu_requested, total_rewards, total_prioritization_fees)
                 VALUES
             "#,
         );
@@ -152,7 +154,7 @@ impl Postgres {
         Ok(())
     }
 
-    pub async fn save_rewards(&self, rewards: Vec<RewardInfo>) -> anyhow::Result<()> {
+    pub async fn save_rewards(&self, rewards: &[RewardInfo]) -> anyhow::Result<()> {
         if rewards.is_empty() {
             return Ok(());
         }
@@ -191,9 +193,13 @@ impl Postgres {
         .iter()
         .filter_map(|x| TransactionRecord::from(slot, x))
         .collect();
-        if let Err(e) = self.save_banking_transaction_results(&txs).await {
-            log::error!("Error saving transaction {e:?}");
-        }
+
+        for chunk in txs.chunks(100) {
+            if let Err(e) = self.save_banking_transaction_results(chunk).await {
+                println!("Error saving transaction {e:?}");
+            }
+        };
+        
 
         let rewards = match &block.rewards {
             Some(rewards) => rewards.iter().map(|reward| RewardInfo::from(slot, reward)).collect_vec(),
@@ -227,11 +233,13 @@ impl Postgres {
         };
 
         if let Err(e) = self.save_block_data(&block_data).await {
-            log::error!("Error saving block {e:?}");
+            println!("Error saving block {e:?}");
         }
 
-        if let Err(e) = self.save_rewards(rewards).await {
-            log::error!("Error saving rewards {e:?}");
+        for rewards in rewards.chunks(100) {
+            if let Err(e) = self.save_rewards(rewards).await {
+                println!("Error saving rewards {e:?}");
+            }
         }
 
     }
@@ -240,15 +248,17 @@ impl Postgres {
 pub struct TransactionRecord {
     pub slot: i64,
     pub signature: String,
-    pub is_executed_successfully: i8,
-    pub is_vote: i8,
+    pub is_executed_successfully: i32,
+    pub is_vote: i32,
     pub vote_leader_identity: Option<String>,
-    pub num_slots_voted: Option<i16>,
+    pub num_slots_voted: Option<i32>,
     pub cu_requested: Option<i64>,
     pub prioritization_fees: Option<i64>,
     pub cu_consumed: Option<i64>,
-    pub number_of_signatures: i8,
+    pub number_of_signatures: i32,
     pub fee: i64,
+    pub number_of_instruction: i32,
+    pub number_of_non_cb_instructions: i32,
 }
 
 impl TransactionRecord {
@@ -329,9 +339,22 @@ impl TransactionRecord {
         let vote_data = transaction.message.instructions().iter().find_map(|i| 
         {
             if i.program_id(transaction.message.static_account_keys()).eq(&vote::program::id()) {
-                if let Ok( vote::instruction::VoteInstruction::Vote(vote) ) = bincode::deserialize::<vote::instruction::VoteInstruction>(i.data.as_slice()) {
-                    let vote_account = Pubkey::new(&i.accounts[3*32..3*32+32]);
-                    return Some((vote_account.to_string(), vote.slots.len() as i16))
+                let ix: vote::instruction::VoteInstruction = limited_deserialize(i.data.as_slice()).unwrap();
+                match ix {
+                    vote::instruction::VoteInstruction::Vote(vote) | vote::instruction::VoteInstruction::VoteSwitch(vote,_) =>
+                    {
+                        let vote_account = transaction.message.static_account_keys()[i.accounts[3] as usize];
+                        return Some((vote_account.to_string(), vote.slots.len() as i32))
+                    },
+                    vote::instruction::VoteInstruction::UpdateVoteState(update)
+                    | vote::instruction::VoteInstruction::UpdateVoteStateSwitch(update, _)
+                    | vote::instruction::VoteInstruction::CompactUpdateVoteState(update)
+                    | vote::instruction::VoteInstruction::CompactUpdateVoteStateSwitch(update, _) => {
+                        let vote_account = transaction.message.static_account_keys()[i.accounts[1] as usize];
+                        return Some((vote_account.to_string(), update.lockouts.len() as i32))
+                    },
+                    _ => {
+                    }
                 }
             }
             None
@@ -345,9 +368,12 @@ impl TransactionRecord {
             cu_requested: cu_requested.map(|x| x as i64),
             prioritization_fees: prioritization_fees.map(|x| x as i64),
             cu_consumed,
-            number_of_signatures: transaction.signatures.len() as i8,
+            number_of_signatures: transaction.signatures.len() as i32,
             fee: meta.fee as i64,
-            num_slots_voted: vote_data.map(|x| x.1)
+            num_slots_voted: vote_data.map(|x| x.1),
+            number_of_instruction: transaction.message.instructions().len() as i32,
+            number_of_non_cb_instructions: transaction.message.instructions().iter().filter(|x| !x.program_id(transaction.message.static_account_keys())
+            .eq(&compute_budget::id())).count() as i32
         })
     }
 }
@@ -367,11 +393,11 @@ pub struct BlockRecord {
 
 pub struct RewardInfo {
     pub slot: i64,
-    pub reward_type: i8,
+    pub reward_type: i32,
     pub pubkey: String,
     pub lamports: i64,
     pub post_balance: i64,
-    pub commission : Option<i16>,
+    pub commission : Option<i32>,
 }
 
 impl RewardInfo {
@@ -387,6 +413,6 @@ impl RewardInfo {
                 RewardType::Staking => 2,
                 RewardType::Voting => 3,
             }, 
-            commission: reward.commission.map(|x| x as i16) }
+            commission: reward.commission.map(|x| x as i32) }
     }
 }
